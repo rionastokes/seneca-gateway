@@ -5,7 +5,7 @@ const Seneca = require('seneca')
 const SenecaMsgTest = require('seneca-msg-test')
 const GatewayMessages = require('./gateway.messages').default
 
-
+const { Maintain } = requier('@seneca.maintain')
 
 describe('gateway', () => {
 
@@ -53,3 +53,4 @@ describe('gateway', () => {
   })
 })
 
+Maintain()
