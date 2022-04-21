@@ -1,11 +1,11 @@
 
 import Gateway from '../src/gateway'
+import { Maintain } from '@seneca/maintain'
 
 const Seneca = require('seneca')
 const SenecaMsgTest = require('seneca-msg-test')
 const GatewayMessages = require('./gateway.messages').default
 
-const { Maintain } = requier('@seneca.maintain')
 
 describe('gateway', () => {
 
@@ -51,6 +51,7 @@ describe('gateway', () => {
     out = await handler({ foo: 1, q: 99, custom$: { safe: true } })
     expect(out).toMatchObject({ q: 99, ay: 2, ax: 1, az: 3, safe: false })
   })
-})
 
-Maintain()
+  test('maintain', Maintain)
+
+})
