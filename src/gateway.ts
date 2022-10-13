@@ -1,12 +1,72 @@
-/* Copyright © 2021 Richard Rodger, MIT License. */
+/* Copyright © 2021-2022 Richard Rodger, MIT License. */
 
-function gateway(this: any, options: any) {
-  const seneca: any = this
+
+import { Open, Skip } from 'gubu'
+
+
+type GatewayResult = {
+  // The action result (transport externalized).
+  // OR: a description of the error.
+  out: any | {
+
+    // Externalized meta.
+    meta$: any
+
+    // Extracted from Error object
+    error$: {
+      name: string
+      code?: string
+      message?: string
+      details?: any
+    }
+  }
+
+  // Indicate if result was an error.
+  error: boolean
+
+  // Original meta object.
+  meta?: any
+
+  // Gateway directives embedded in action result.
+  // NOTE: $ suffix as output directive.
+  gateway$?: Record<string, any>
+}
+
+
+type GatewayOptions = {
+  allow: any,
+  custom: any
+  fixed: any,
+  error: {
+    message: boolean
+    details: boolean
+  }
+  debug: boolean
+}
+
+
+function gateway(this: any, options: GatewayOptions) {
+  let seneca: any = this
   const root: any = seneca.root
   const tu: any = seneca.export('transport/utils')
 
+  const Patrun = seneca.util.Patrun
+  const Jsonic = seneca.util.Jsonic
+  const allowed = new Patrun({ gex: true })
+
+  const checkAllowed = null != options.allow
+  // console.log('CA', checkAllowed, options)
+
+  if (checkAllowed) {
+    for (let patStr in options.allow) {
+      let pat = Jsonic(patStr)
+      allowed.add(pat, true)
+    }
+  }
+
 
   const hooknames = [
+
     // Functions to modify the custom object in Seneca message meta$ descriptions
     'custom',
 
@@ -27,6 +87,12 @@ function gateway(this: any, options: any) {
 
   const hooks: any = hooknames.reduce((a: any, n) => (a[n] = [], a), {})
 
+  const tag = seneca.plugin.tag
+  if (null != tag && '-' !== tag) {
+    seneca = seneca.fix({ tag })
+  }
+
+
   seneca.message('sys:gateway,add:hook', async function add_hook(msg: any) {
     let hook: string = msg.hook
     let action: (...params: any[]) => any = msg.action
@@ -37,6 +103,8 @@ function gateway(this: any, options: any) {
       return { ok: true, hook, count: hookactions.length }
     }
     else {
+      // TODO: this should fail, as usually a startup action
+      // this.throw('no-action', {hook})
       return { ok: false, why: 'no-action' }
     }
   })
@@ -52,12 +120,41 @@ function gateway(this: any, options: any) {
   // Handle inbound JSON, converting it into a message, and submitting to Seneca.
   async function handler(json: any, ctx: any) {
     const seneca = await prepare(json, ctx)
-    const msg = tu.internalize_msg(seneca, json)
+    const rawmsg = tu.internalize_msg(seneca, json)
 
-    // TODO: disallow directives!
+    const msg = seneca.util.clean(rawmsg)
 
     return await new Promise(async (resolve) => {
-      var out = null
+      if (checkAllowed) {
+        let allowMsg = false
+
+        // First, find msg that will be called
+        let msgdef = seneca.find(msg)
+        if (msgdef) {
+          // Second, check found msg matches allowed patterns
+          // NOTE: just doing allowed.find(msg) will enable separate messages
+          // to sneak in: if foo:1 is allowed but not defined, foo:1,role:seneca,...
+          // will still work, which is not what we want!
+          allowMsg = !!allowed.find(msgdef.msgcanon)
+        }
+
+        if (!allowMsg) {
+          return resolve({
+            error: true,
+            out: {
+              meta$: { id: rawmsg.id$ },
+              error$: nundef({
+                name: 'Error',
+                code: 'not-allowed',
+                message: 'Message not allowed',
+                details: undefined,
+              })
+            }
+          })
+        }
+      }
+
+      let out = null
       for (var i = 0; i < hooks.action.length; i++) {
         out = await hooks.action[i].call(seneca, msg, ctx)
         if (out) {
@@ -74,21 +171,10 @@ function gateway(this: any, options: any) {
           err.stack = null
         }
 
-        var out = tu.externalize_reply(this, err, out, meta)
+        out = tu.externalize_reply(this, err, out, meta)
 
         // Don't expose internal activity unless debugging
         if (!options.debug) {
-
-          // TODO: externalize_reply should help with this
-          if (err) {
-            out = {
-              seneca$: true,
-              code$: err.code,
-              error$: true,
-              meta$: out.$meta,
-            }
-          }
-
           if (out.meta$) {
             out.meta$ = {
               id: out.meta$.id
@@ -96,7 +182,30 @@ function gateway(this: any, options: any) {
           }
         }
 
-        resolve(out)
+        let result: GatewayResult = {
+          error: false,
+          out,
+          meta,
+          gateway$: out.gateway$ || {}
+        }
+
+        // Directives in gateway$ moved to result
+        delete out.gateway$
+
+        if (err) {
+          result.error = true
+          result.out = {
+            meta$: out.meta$,
+            error$: nundef({
+              name: err.name,
+              code: (err as any).code,
+              message: options.error.message ? err.message : undefined,
+              details: options.error.details ? err.details : undefined,
+            })
+          }
+        }
+
+        resolve(result)
       })
     })
   }
@@ -128,11 +237,11 @@ function gateway(this: any, options: any) {
       }
     }
 
-
+    // NOTE: a new delegate is created for each request to ensure isolation.
     const delegate = root.delegate(fixed, { custom: custom })
 
     for (i = 0; i < hooks.delegate.length; i++) {
-      await hooks.delegate[i](delegate, json, ctx)
+      await hooks.delegate[i].call(delegate, json, ctx)
     }
 
     return delegate
@@ -147,12 +256,13 @@ function gateway(this: any, options: any) {
     try {
       return JSON.parse(str)
     } catch (e: any) {
-      e.error$ = e.message
-      e.input$ = str
+      e.handler$ = {
+        error$: e.message,
+        input$: str,
+      }
       return e
     }
   }
-
 
   return {
     exports: {
@@ -163,21 +273,46 @@ function gateway(this: any, options: any) {
 }
 
 
+function nundef(o: any) {
+  for (let p in o) {
+    if (undefined === o[p]) {
+      delete o[p]
+    }
+  }
+  return o
+}
+
+
 // Default options.
 gateway.defaults = {
 
-  custom: {
+  allow: Skip(Open({})),
+
+  custom: Open({
 
     // Assume gateway is used to handle external messages.
     safe: false
-  },
+  }),
 
-  fixed: {},
+  fixed: Open({}),
+
+  error: {
+    // Include exception object message property in response.
+    message: false,
+
+    // Include exception object details property in response.
+    details: false,
+  },
 
   // When true, errors will include stack trace.
   debug: false
 }
 
+
+export type {
+  GatewayOptions,
+  GatewayResult,
+}
 
 export default gateway
 

@@ -1,10 +1,22 @@
 "use strict";
-/* Copyright © 2021 Richard Rodger, MIT License. */
+/* Copyright © 2021-2022 Richard Rodger, MIT License. */
 Object.defineProperty(exports, "__esModule", { value: true });
+const gubu_1 = require("gubu");
 function gateway(options) {
-    const seneca = this;
+    let seneca = this;
     const root = seneca.root;
     const tu = seneca.export('transport/utils');
+    const Patrun = seneca.util.Patrun;
+    const Jsonic = seneca.util.Jsonic;
+    const allowed = new Patrun({ gex: true });
+    const checkAllowed = null != options.allow;
+    // console.log('CA', checkAllowed, options)
+    if (checkAllowed) {
+        for (let patStr in options.allow) {
+            let pat = Jsonic(patStr);
+            allowed.add(pat, true);
+        }
+    }
     const hooknames = [
         // Functions to modify the custom object in Seneca message meta$ descriptions
         'custom',
@@ -20,6 +32,10 @@ function gateway(options) {
         'result'
     ];
     const hooks = hooknames.reduce((a, n) => (a[n] = [], a), {});
+    const tag = seneca.plugin.tag;
+    if (null != tag && '-' !== tag) {
+        seneca = seneca.fix({ tag });
+    }
     seneca.message('sys:gateway,add:hook', async function add_hook(msg) {
         let hook = msg.hook;
         let action = msg.action;
@@ -29,6 +45,8 @@ function gateway(options) {
             return { ok: true, hook, count: hookactions.length };
         }
         else {
+            // TODO: this should fail, as usually a startup action
+            // this.throw('no-action', {hook})
             return { ok: false, why: 'no-action' };
         }
     });
@@ -40,10 +58,36 @@ function gateway(options) {
     // Handle inbound JSON, converting it into a message, and submitting to Seneca.
     async function handler(json, ctx) {
         const seneca = await prepare(json, ctx);
-        const msg = tu.internalize_msg(seneca, json);
-        // TODO: disallow directives!
+        const rawmsg = tu.internalize_msg(seneca, json);
+        const msg = seneca.util.clean(rawmsg);
         return await new Promise(async (resolve) => {
-            var out = null;
+            if (checkAllowed) {
+                let allowMsg = false;
+                // First, find msg that will be called
+                let msgdef = seneca.find(msg);
+                if (msgdef) {
+                    // Second, check found msg matches allowed patterns
+                    // NOTE: just doing allowed.find(msg) will enable separate messages
+                    // to sneak in: if foo:1 is allowed but not defined, foo:1,role:seneca,...
+                    // will still work, which is not what we want!
+                    allowMsg = !!allowed.find(msgdef.msgcanon);
+                }
+                if (!allowMsg) {
+                    return resolve({
+                        error: true,
+                        out: {
+                            meta$: { id: rawmsg.id$ },
+                            error$: nundef({
+                                name: 'Error',
+                                code: 'not-allowed',
+                                message: 'Message not allowed',
+                                details: undefined,
+                            })
+                        }
+                    });
+                }
+            }
+            let out = null;
             for (var i = 0; i < hooks.action.length; i++) {
                 out = await hooks.action[i].call(seneca, msg, ctx);
                 if (out) {
@@ -57,25 +101,36 @@ function gateway(options) {
                 if (err && !options.debug) {
                     err.stack = null;
                 }
-                var out = tu.externalize_reply(this, err, out, meta);
+                out = tu.externalize_reply(this, err, out, meta);
                 // Don't expose internal activity unless debugging
                 if (!options.debug) {
-                    // TODO: externalize_reply should help with this
-                    if (err) {
-                        out = {
-                            seneca$: true,
-                            code$: err.code,
-                            error$: true,
-                            meta$: out.$meta,
-                        };
-                    }
                     if (out.meta$) {
                         out.meta$ = {
                             id: out.meta$.id
                         };
                     }
                 }
-                resolve(out);
+                let result = {
+                    error: false,
+                    out,
+                    meta,
+                    gateway$: out.gateway$ || {}
+                };
+                // Directives in gateway$ moved to result
+                delete out.gateway$;
+                if (err) {
+                    result.error = true;
+                    result.out = {
+                        meta$: out.meta$,
+                        error$: nundef({
+                            name: err.name,
+                            code: err.code,
+                            message: options.error.message ? err.message : undefined,
+                            details: options.error.details ? err.details : undefined,
+                        })
+                    };
+                }
+                resolve(result);
             });
         });
     }
@@ -101,9 +156,10 @@ function gateway(options) {
                 await hookaction(fixed, json, ctx);
             }
         }
+        // NOTE: a new delegate is created for each request to ensure isolation.
         const delegate = root.delegate(fixed, { custom: custom });
         for (i = 0; i < hooks.delegate.length; i++) {
-            await hooks.delegate[i](delegate, json, ctx);
+            await hooks.delegate[i].call(delegate, json, ctx);
         }
         return delegate;
     }
@@ -115,8 +171,10 @@ function gateway(options) {
             return JSON.parse(str);
         }
         catch (e) {
-            e.error$ = e.message;
-            e.input$ = str;
+            e.handler$ = {
+                error$: e.message,
+                input$: str,
+            };
             return e;
         }
     }
@@ -127,13 +185,28 @@ function gateway(options) {
         }
     };
 }
+function nundef(o) {
+    for (let p in o) {
+        if (undefined === o[p]) {
+            delete o[p];
+        }
+    }
+    return o;
+}
 // Default options.
 gateway.defaults = {
-    custom: {
+    allow: (0, gubu_1.Skip)((0, gubu_1.Open)({})),
+    custom: (0, gubu_1.Open)({
         // Assume gateway is used to handle external messages.
         safe: false
+    }),
+    fixed: (0, gubu_1.Open)({}),
+    error: {
+        // Include exception object message property in response.
+        message: false,
+        // Include exception object details property in response.
+        details: false,
     },
-    fixed: {},
     // When true, errors will include stack trace.
     debug: false
 };
